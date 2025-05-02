@@ -33,17 +33,17 @@ COCO Stuff 164K	Inductive	63.1	40.9	41.6	41.2	[Google Drive]
 COCO Stuff 164K	Transductive	69.9	42.0	60.8	49.7	[Google Drive]
 COCO Stuff 164K	Fully	70.8	42.9	64.1	51.4	[Google Drive]
 Usage
-Inductive Training
-# for example
+
+# Inductive Training
 bash dist_train.sh configs/voc12/clip_rc_zero_vit-b_512x512_40k_voc_10_16.py work_dirs/clip_rc_zero_vit-b_512x512_40k_voc_10_16 2
-Transductive Training
-# for example
+
+# Transductive Training
 bash dist_train.sh configs/voc12/clip_rc_zero_vit-b_512x512_20k_voc_10_16_st.py work_dirs/clip_rc_zero_vit-b_512x512_20k_voc_10_16_st 2 --load-from work_dirs/clip_rc_zero_vit-b_512x512_40k_voc_10_16/iter_20000.pth
-Fully supervised Training
-# for example
+
+# Fully supervised Training
 bash dist_train.sh configs/voc12/clip_rc_fully_vit-b_512x512_40k_voc_10_16.py work_dirs/clip_rc_fully_vit-b_512x512_40k_voc_10_16 2
-Test
-# for example
+
+# Test
 python test.py configs/voc12/clip_rc_zero_vit-b_512x512_40k_voc_10_16.py work_dirs/voc_zero.pth --eval mIoU
 Parameters and FLOPs
 python get_flops.py configs/voc12/clip_rc_zero_vit-b_512x512_40k_voc_10_16.py --shape 512 512 --fvcore
