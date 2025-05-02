@@ -15,7 +15,7 @@ class CLIPVisionTransformerWithRLB(nn.Module):
 
     def __init__(self,
                  input_resolution=224,
-                 patch_size=32,
+                 patch_size=16,
                  width=768,
                  layers=12,
                  heads=12,
@@ -27,7 +27,6 @@ class CLIPVisionTransformerWithRLB(nn.Module):
                  num_tokens=20,
                  prompt_dim=512,
                  total_d_layer=11,
-                 region_level_bridge_size=16,
                  **kwargs):
         super().__init__()
         self.pretrained = pretrained
@@ -41,8 +40,12 @@ class CLIPVisionTransformerWithRLB(nn.Module):
 
         scale = width**-0.5
         self.class_embedding = nn.Parameter(scale * torch.randn(width))
+        self.unseen_cls_token = nn.Parameter(scale * torch.randn(width))
+        
+        # Initialize positional embedding for both CLS and unseen tokens
         self.positional_embedding = nn.Parameter(scale * torch.randn(
-            (input_resolution // patch_size)**2 + 1, width))
+            (input_resolution // patch_size)**2 + 2, width))  # +2 for cls and unseen tokens
+        
         self.spatial_size = input_resolution // patch_size
         self.ln_pre = LayerNorm(width)
         self.get_embeddings = get_embeddings
@@ -53,22 +56,11 @@ class CLIPVisionTransformerWithRLB(nn.Module):
         self.prompt_dim = prompt_dim
         self.total_d_layer = total_d_layer
 
-        self.region_level_bridge_size = region_level_bridge_size
-
-        self.region_level_bridge_hw = int(
-            math.sqrt(self.region_level_bridge_size))
-        self.region_level_bridge = nn.Parameter(torch.zeros(
-            self.region_level_bridge_size, prompt_dim),
-                                                requires_grad=True)
-
-        visual_mask = self.gen_attention_mask(stride=self.spatial_size //
-                                              self.region_level_bridge_hw)
         self.transformer = Transformer(
             width,
             layers,
             heads,
             drop_path_rate=drop_path_rate,
-            attn_mask=visual_mask,
         )
 
         self.out_indices = out_indices
@@ -80,38 +72,6 @@ class CLIPVisionTransformerWithRLB(nn.Module):
         # Add the prompt parameters
         self._init_prompt(patch_size, self.num_tokens, self.prompt_dim,
                           self.total_d_layer)
-
-    def gen_attention_mask(self, stride):
-        # cls, vpt, image feature, region level bridge
-        att_size = 1 + self.num_tokens + self.spatial_size**2 + self.region_level_bridge_size
-        rlb_index = -self.region_level_bridge_size
-        visual_mask = torch.zeros((att_size, att_size),
-                                  requires_grad=False,
-                                  dtype=torch.float32)
-        visual_mask[:, rlb_index:] = float("-inf")
-        visual_mask[rlb_index:, :] = float("-inf")
-        # gen att_size * att_size index
-        for i in range(self.region_level_bridge_hw):
-            for j in range(self.region_level_bridge_hw):
-                tmp_mask = torch.zeros((self.spatial_size, self.spatial_size),
-                                       requires_grad=False)
-                tmp_mask[i * stride:(i + 1) * stride,
-                         j * stride:(j + 1) * stride] = 1
-
-                idx = tmp_mask.flatten().nonzero() + self.num_tokens + 1
-                visual_mask[rlb_index + i * self.region_level_bridge_hw + j,
-                            idx] = 0
-
-                visual_mask[idx, rlb_index + i * self.region_level_bridge_hw +
-                            j] = 0
-
-        for i in range(self.region_level_bridge_size):
-            visual_mask[rlb_index + i, rlb_index + i] = 0
-
-        # import cv2
-        # cv2.imwrite('visual_mask.png', (visual_mask.numpy() + 1) * 255)
-
-        return visual_mask
 
     def _init_prompt(self, patch, num_tokens, prompt_dim, total_d_layer):
         patch_size = []
@@ -153,73 +113,76 @@ class CLIPVisionTransformerWithRLB(nn.Module):
                     state_dict[new_k] = checkpoint[k]
 
             if 'positional_embedding' in state_dict.keys():
-                if self.positional_embedding.shape != state_dict[
-                        'positional_embedding'].shape:
-                    # (1025, 768)                      (197, 768)
-                    print(
-                        f'Resize the pos_embed shape from {state_dict["positional_embedding"].shape} to {self.positional_embedding.shape}'
-                    )
+                if self.positional_embedding.shape != state_dict['positional_embedding'].shape:
+                    print(f'Resize the pos_embed shape from {state_dict["positional_embedding"].shape} to {self.positional_embedding.shape}')
+                    
+                    # Get the cls token position
                     cls_pos = state_dict["positional_embedding"][0:1, :]
-
+                    
+                    # Calculate original and new sizes
+                    orig_num_patches = state_dict["positional_embedding"].shape[0] - 1  # 196 (14x14)
+                    orig_size = int(math.sqrt(orig_num_patches))  # 14
+                    new_size = self.spatial_size  # 32 for 512 input with patch_size 16
+                    
+                    # Reshape and interpolate the spatial positional embeddings
                     spatial_pos = F.interpolate(
-                        state_dict["positional_embedding"][
-                            1:,
-                        ].reshape(1, 14, 14, 768).permute(0, 3, 1, 2),
-                        size=(self.spatial_size, self.spatial_size),
-                        mode='bilinear')
-                    spatial_pos = spatial_pos.reshape(
-                        768,
-                        self.spatial_size * self.spatial_size).permute(1, 0)
-                    positional_embedding = torch.cat([cls_pos, spatial_pos],
-                                                     dim=0)
+                        state_dict["positional_embedding"][1:].reshape(1, orig_size, orig_size, -1).permute(0, 3, 1, 2),
+                        size=(new_size, new_size),
+                        mode='bicubic',
+                        align_corners=False)
+                    
+                    # Reshape back
+                    spatial_pos = spatial_pos.permute(0, 2, 3, 1).reshape(-1, state_dict["positional_embedding"].shape[-1])
+                    
+                    # Initialize unseen token position same as cls token
+                    unseen_pos = cls_pos.clone()
+                    
+                    # Concatenate cls token, unseen token, and spatial positions
+                    positional_embedding = torch.cat([cls_pos, unseen_pos, spatial_pos], dim=0)
+                    
                     state_dict['positional_embedding'] = positional_embedding
-                    assert self.positional_embedding.shape == state_dict[
-                        'positional_embedding'].shape
+                    assert self.positional_embedding.shape == state_dict['positional_embedding'].shape
 
             u, w = self.load_state_dict(state_dict, False)
             print(u, w, 'are misaligned params in vision transformer')
-
-            # init self.region_level_bridge by cls_token
-            region_level_bridge_init = state_dict['class_embedding'].repeat(
-                self.region_level_bridge_size, 1)
-
-            self.region_level_bridge.data = region_level_bridge_init + cls_pos.repeat(
-                self.region_level_bridge_size, 1)
 
     def forward(self, x: torch.Tensor):
         x = self.conv1(x)
         B, C, H, W = x.shape
         x = x.reshape(x.shape[0], x.shape[1], -1)
         x = x.permute(0, 2, 1)
-        x = torch.cat([
-            self.class_embedding.to(x.dtype) + torch.zeros(
-                x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x
-        ],
-                      dim=1)
+        
+        # Add both class token and unseen token
+        class_token = self.class_embedding.to(x.dtype) + torch.zeros(
+            x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device)
+        unseen_token = self.unseen_cls_token.to(x.dtype) + torch.zeros(
+            x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device)
+        x = torch.cat([class_token, unseen_token, x], dim=1)
 
         pos = self.positional_embedding.to(x.dtype)
         cls_pos = pos[0, :] + self.class_embedding.to(x.dtype)
-        spatial_pos = F.interpolate(pos[
-            1:,
-        ].reshape(1, self.spatial_size, self.spatial_size,
-                  C).permute(0, 3, 1, 2),
+        unseen_pos = pos[1, :] + self.unseen_cls_token.to(x.dtype)
+        spatial_pos = F.interpolate(pos[2:].reshape(1, self.spatial_size, self.spatial_size,
+                                                   C).permute(0, 3, 1, 2),
                                     size=(H, W),
-                                    mode='bilinear')
+                                    mode='bicubic',
+                                    align_corners=False)
         spatial_pos = spatial_pos.reshape(1, C, H * W).permute(0, 2, 1)
-        pos = torch.cat([cls_pos.reshape(1, 1, C), spatial_pos], dim=1)
+        pos = torch.cat([
+            cls_pos.reshape(1, 1, C),
+            unseen_pos.reshape(1, 1, C),
+            spatial_pos
+        ], dim=1)
         x = x + pos
-
-        # x concat self.region_level_bridge
-        x = torch.cat([x, self.region_level_bridge.expand(B, -1, -1)], dim=1)
 
         x = self.ln_pre(x)
 
         if self.total_d_layer >= 0:
             # concat prompt
-            x = torch.cat((x[:, :1, :],
+            x = torch.cat((x[:, :2, :],  # Keep both tokens
                            self.prompt_dropout(
                                self.prompt_proj(self.prompt_embeddings).expand(
-                                   B, -1, -1)), x[:, 1:, :]),
+                                   B, -1, -1)), x[:, 2:, :]),
                           dim=1)
 
         x = x.permute(1, 0, 2)
@@ -232,7 +195,7 @@ class CLIPVisionTransformerWithRLB(nn.Module):
                 if len(self.out_indices) > 1:
                     if i in self.out_indices:
                         xp = x.permute(1, 0,
-                                       2)[:, 1 + self.num_tokens:, :].permute(
+                                       2)[:, 2 + self.num_tokens:, :].permute(
                                            0, 2, 1).reshape(B, -1, H, W)
                         features.append(xp.contiguous())
         elif self.total_d_layer > 0:  # deep
@@ -243,15 +206,10 @@ class CLIPVisionTransformerWithRLB(nn.Module):
             x = self.ln_post(x)
             x = x @ self.proj
 
-            global_embedding = x[:, 0]
-            visual_embedding = x[:, 1 + self.num_tokens:-self.
-                                 region_level_bridge_size].reshape(
+            global_embedding = x[:, 0]  # cls token
+            unseen_embedding = x[:, 1]  # unseen token
+            visual_embedding = x[:, 2 + self.num_tokens:].reshape(
                                      B, H, W, -1).permute(0, 3, 1, 2)
-            region_level_bridge = x[:,
-                                    -self.region_level_bridge_size:].reshape(
-                                        B, self.region_level_bridge_hw,
-                                        self.region_level_bridge_hw,
-                                        -1).permute(0, 3, 1, 2)
 
             if len(self.out_indices) == 1:
                 visual_embedding = visual_embedding / visual_embedding.norm(
@@ -261,10 +219,10 @@ class CLIPVisionTransformerWithRLB(nn.Module):
             outs.append(tuple(features))
             global_embedding = global_embedding / global_embedding.norm(
                 dim=1, keepdim=True)
-            outs.append(global_embedding)
-            region_level_bridge = region_level_bridge / region_level_bridge.norm(
+            unseen_embedding = unseen_embedding / unseen_embedding.norm(
                 dim=1, keepdim=True)
-            outs.append(region_level_bridge)
+            outs.append(global_embedding)
+            outs.append(unseen_embedding)
         return outs
 
     def forward_deep_prompt(self,
@@ -284,34 +242,29 @@ class CLIPVisionTransformerWithRLB(nn.Module):
                         self.deep_prompt_embeddings[i - 1]).expand(
                             B, -1, -1)).permute(1, 0, 2)
                 hidden_states = torch.cat(
-                    (hidden_states[:1, :, :], deep_prompt_emb,
-                     hidden_states[(1 + self.num_tokens):, :, :]),
+                    (hidden_states[:2, :, :],  # Keep both tokens
+                     deep_prompt_emb,
+                     hidden_states[(2 + self.num_tokens):, :, :]),
                     dim=0)
                 hidden_states = self.transformer.resblocks[i](hidden_states)
             else:
                 hidden_states = torch.cat(
-                    (hidden_states[:1, :, :],
-                     hidden_states[(1 + self.num_tokens):, :, :]),
+                    (hidden_states[:2, :, :],  # Keep both tokens
+                     hidden_states[(2 + self.num_tokens):, :, :]),
                     dim=0)
                 hidden_states = self.transformer.resblocks[i](hidden_states)
 
             if len(self.out_indices) > 1:
                 if i in self.out_indices:
                     xp = hidden_states.permute(
-                        1, 0, 2)[:,
-                                 (1 + self.num_tokens
-                                  ):-self.region_level_bridge_size, :].permute(
+                        1, 0, 2)[:, 2 + self.num_tokens:, :].permute(
                                       0, 2, 1).reshape(B, -1, H, W)
                     features.append(xp.contiguous())
 
             if i == (self.num_layers - 2):
                 before_last_feats = self.prompt_norm(hidden_states)
 
-        encoded = torch.concat(
-            (self.prompt_norm(
-                hidden_states[:-self.region_level_bridge_size, :, :]),
-             hidden_states[-self.region_level_bridge_size:, :, :]),
-            dim=0)
+        encoded = self.prompt_norm(hidden_states)
         if out_last:
             return before_last_feats
         else:

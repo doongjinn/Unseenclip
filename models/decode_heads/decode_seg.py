@@ -1,36 +1,156 @@
-import math
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from ast import Gt
+import numpy as np
+from mmcv.cnn import ConvModule
+from mmseg.ops import Upsample, resize
 
-from mmcv.runner import force_fp32
-from mmseg.models.losses import accuracy
 from mmseg.models.builder import HEADS
 from mmseg.models.decode_heads.decode_head import BaseDecodeHead
 
-from .utils import trunc_normal_init, constant_init, RecoveryDecoder, TPN_DecoderLayer, TPN_Decoder
+import torch
+from torch import Tensor
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn import TransformerDecoder, TransformerDecoderLayer
+from typing import Optional
+import math
+from functools import partial
+from mmcv.runner import auto_fp16, force_fp32
+import matplotlib.pyplot as plt
 
+from timm.models.layers import trunc_normal_
+import matplotlib.pyplot as plt
+from mmseg.models.losses import accuracy
+
+def trunc_normal_init(module: nn.Module,
+                      mean: float = 0,
+                      std: float = 1,
+                      a: float = -2,
+                      b: float = 2,
+                      bias: float = 0) -> None:
+    if hasattr(module, 'weight') and module.weight is not None:
+        trunc_normal_(module.weight, mean, std, a, b)  # type: ignore
+    if hasattr(module, 'bias') and module.bias is not None:
+        nn.init.constant_(module.bias, bias)  # type: ignore
+
+def constant_init(module, val, bias=0):
+    if hasattr(module, 'weight') and module.weight is not None:
+        nn.init.constant_(module.weight, val)
+    if hasattr(module, 'bias') and module.bias is not None:
+        nn.init.constant_(module.bias, bias)
+
+class TPN_Decoder(TransformerDecoder):
+    def forward(self, tgt: Tensor, memory: Tensor, tgt_mask: Optional[Tensor] = None,
+                memory_mask: Optional[Tensor] = None, tgt_key_padding_mask: Optional[Tensor] = None,
+                memory_key_padding_mask: Optional[Tensor] = None):
+        output = tgt
+        attns = []
+        outputs = []
+        for mod in self.layers:
+            output, attn = mod(output, memory, tgt_mask=tgt_mask,
+                         memory_mask=memory_mask,
+                         tgt_key_padding_mask=tgt_key_padding_mask,
+                         memory_key_padding_mask=memory_key_padding_mask)
+            attns.append(attn)
+            outputs.append(output)
+        if self.norm is not None: # not do
+            output = self.norm(output)
+
+        return outputs, attns
+
+class TPN_DecoderLayer(TransformerDecoderLayer):
+    def __init__(self, **kwargs):
+        super(TPN_DecoderLayer, self).__init__(**kwargs)
+        del self.multihead_attn
+        self.multihead_attn = Attention(
+            kwargs['d_model'], num_heads=kwargs['nhead'], qkv_bias=True, attn_drop=0.1)
+
+    def forward(self, tgt: Tensor, memory: Tensor, tgt_mask: Optional[Tensor] = None,
+                memory_mask: Optional[Tensor] = None,
+                tgt_key_padding_mask: Optional[Tensor] = None,
+                memory_key_padding_mask: Optional[Tensor] = None) -> Tensor:
+
+        tgt2, attn2 = self.multihead_attn(
+            tgt.transpose(0, 1), memory.transpose(0, 1), memory.transpose(0, 1))
+        tgt = tgt + self.dropout2(tgt2)
+        tgt = self.norm2(tgt)
+        tgt2 = self.linear2(self.dropout(self.activation(self.linear1(tgt))))
+        tgt = tgt + self.dropout3(tgt2)
+        tgt = self.norm3(tgt)
+        return tgt, attn2
+
+class Attention(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        # NOTE scale factor was wrong in my original version, can set manually to be compat with prev weights
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.q = nn.Linear(dim, dim, bias=qkv_bias)
+        self.k = nn.Linear(dim, dim, bias=qkv_bias)
+        self.v = nn.Linear(dim, dim, bias=qkv_bias)
+
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, xq, xk, xv):
+        B, Nq, C = xq.size() # 1, 21, 512
+        Nk = xk.size()[1]
+        Nv = xv.size()[1]
+
+        q = self.q(xq).reshape(B, Nq, self.num_heads,
+                                      C // self.num_heads).permute(0, 2, 1, 3)
+        k = self.k(xk).reshape(B, Nk, self.num_heads,
+                                      C // self.num_heads).permute(0, 2, 1, 3)
+        v = self.v(xv).reshape(B, Nv, self.num_heads,
+                                      C // self.num_heads).permute(0, 2, 1, 3)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn_save = attn.clone()
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, Nq, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x.transpose(0, 1), attn_save.sum(dim=1) / self.num_heads
+
+
+class MLP(nn.Module):
+    """Very simple multi-layer perceptron (also called FFN)"""
+
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+        h = [hidden_dim] * (num_layers - 1)
+        self.layers = nn.ModuleList(
+            nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim])
+        )
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
+        return x
 
 @HEADS.register_module()
 class ATMSingleHeadSeg(BaseDecodeHead):
-
     def __init__(
-        self,
-        img_size,
-        in_channels,
-        seen_idx,
-        all_idx,
-        embed_dims=768,
-        num_layers=3,
-        num_heads=8,
-        use_stages=1,
-        use_proj=True,
-        crop_train=False,
-        recovery_decoder_num_layers=1,
-        **kwargs,
+            self,
+            img_size,
+            in_channels,
+            seen_idx,
+            all_idx,
+            embed_dims=768,
+            num_layers=3,
+            num_heads=8,
+            use_stages=1,
+            use_proj=True,
+            crop_train=False,
+            **kwargs,
     ):
-        super(ATMSingleHeadSeg, self).__init__(in_channels=in_channels,
-                                               **kwargs)
+        super(ATMSingleHeadSeg, self).__init__(
+            in_channels=in_channels, **kwargs)
 
         self.image_size = img_size
         self.use_stages = use_stages
@@ -39,9 +159,9 @@ class ATMSingleHeadSeg(BaseDecodeHead):
         self.all_idx = all_idx
         nhead = num_heads
         dim = embed_dims
-        self.num_layers = num_layers
         input_proj = []
         proj_norm = []
+        atm_decoders = []
 
         self.unseen_idx = self.all_idx.copy()
         for i_idx in self.seen_idx:
@@ -51,7 +171,7 @@ class ATMSingleHeadSeg(BaseDecodeHead):
             # FC layer to change ch
             if use_proj:
                 proj = nn.Linear(self.in_channels, dim)
-                trunc_normal_init(proj, std=.02)
+                trunc_normal_(proj.weight, std=.02)
             else:
                 proj = nn.Identity()
             self.add_module("input_proj_{}".format(i + 1), proj)
@@ -64,26 +184,20 @@ class ATMSingleHeadSeg(BaseDecodeHead):
             self.add_module("proj_norm_{}".format(i + 1), norm)
             proj_norm.append(norm)
             # decoder layer
-            decoder_layer = TPN_DecoderLayer(d_model=dim,
-                                             nhead=nhead,
-                                             dim_feedforward=dim * 4)
+            decoder_layer = TPN_DecoderLayer(d_model=dim, nhead=nhead, dim_feedforward=dim * 4)
             decoder = TPN_Decoder(decoder_layer, num_layers)
+            self.add_module("decoder_{}".format(i + 1), decoder)
+            atm_decoders.append(decoder)
 
         self.input_proj = input_proj
         self.proj_norm = proj_norm
-        self.decoder_q = decoder
-
-        decoder_layer_v = TPN_DecoderLayer(d_model=dim,
-                                           nhead=nhead,
-                                           dim_feedforward=dim * 4)
-        self.decoder_v = TPN_Decoder(decoder_layer_v, num_layers)
-
-        self.recovery_decoder = RecoveryDecoder(dim, nhead,
-                                              recovery_decoder_num_layers)
+        self.decoder = atm_decoders
 
         delattr(self, 'conv_seg')
-        self.lateral_proj = nn.Linear(dim * 3, dim)
+
         self.q_proj = nn.Linear(dim * 2, dim)
+        # Remove the projection layer for concatenated visual tokens
+        # self.visual_proj = nn.Linear(dim * 2, dim)
 
     def init_weights(self):
         for n, m in self.named_modules():
@@ -91,33 +205,23 @@ class ATMSingleHeadSeg(BaseDecodeHead):
                 trunc_normal_init(m, std=.02, bias=0)
             elif isinstance(m, nn.LayerNorm):
                 constant_init(m, val=1.0, bias=0.0)
-        # init self.decoder_v.layers[*].linear2.weight to zero
-        for i in range(self.num_layers):
-            constant_init(self.decoder_v.layers[i].linear2, val=0)
 
-    def forward_train(self,
-                      inputs,
-                      img_metas,
-                      gt_semantic_seg,
-                      train_cfg,
-                      self_training=False,
-                      st_mask=None):
+    def forward_train(self, inputs, img_metas, gt_semantic_seg, train_cfg, self_training=False, st_mask=None, 
+                      unseen_token=None, dino_cls_token=None):
         seg_logits = self.forward(inputs)
 
         if self_training:
-            pseudo_semantic_masks = seg_logits['pred_masks'].clone().detach(
-            ).sigmoid()
+            pseudo_semantic_masks = seg_logits['pred_masks'].clone().detach().sigmoid()
             pseudo_semantic_masks[:, self.seen_idx, :, :] = -1
-            pseudo_semantic_seg = pseudo_semantic_masks.argmax(
-                dim=1).unsqueeze(1)
+            pseudo_semantic_seg = pseudo_semantic_masks.argmax(dim=1).unsqueeze(1)
             # generate pseudo labels for "transductive" setting
-            gt_semantic_seg[gt_semantic_seg == -1] = pseudo_semantic_seg[
-                gt_semantic_seg == -1]
-            gt_semantic_seg[gt_semantic_seg == -1] = 255
-            losses = self.losses(seg_logits, gt_semantic_seg)
+            gt_semantic_seg[gt_semantic_seg==-1] = pseudo_semantic_seg[gt_semantic_seg==-1]
+            gt_semantic_seg[gt_semantic_seg==-1] = 255
+            losses = self.losses(seg_logits, gt_semantic_seg, unseen_token=unseen_token, dino_cls_token=dino_cls_token)
+
         else:
-            gt_semantic_seg[gt_semantic_seg == -1] = 255
-            losses = self.losses(seg_logits, gt_semantic_seg)
+            gt_semantic_seg[gt_semantic_seg==-1] = 255
+            losses = self.losses(seg_logits, gt_semantic_seg, unseen_token=unseen_token, dino_cls_token=dino_cls_token)
 
         return losses
 
@@ -125,27 +229,23 @@ class ATMSingleHeadSeg(BaseDecodeHead):
         return self.forward(inputs, self_training)
 
     def forward(self, inputs_both, self_training=None):
+        inputs = inputs_both[0][0]
+        cls_token = inputs_both[0][1]
+        unseen_token = inputs_both[0][2]
+        text_token = inputs_both[1]
+        
         x = []
+        for stage_ in inputs[:self.use_stages]:
+            x.append(self.d4_to_d3(stage_) if stage_.dim() > 3 else stage_)
+        x.reverse()
+        bs = x[0].size()[0]
+
         laterals = []
         attns = []
         maps_size = []
         qs = []
-        out = {}
 
-        inputs = inputs_both[0][0]
-        cls_token = inputs_both[0][1]
-        text_token = inputs_both[1]
-        region_level_bridge = inputs_both[0][2]
-
-        _, _, h_rlb, w_rlb = region_level_bridge.size()
-        bs, d, H, W = inputs[0].size()
-
-        for stage_ in inputs[:self.use_stages]:
-            x.append(self.d4_to_d3(stage_) if stage_.dim() > 3 else stage_)
-        x.reverse()
-
-        for idx, (x_, proj_,
-                  norm_) in enumerate(zip(x, self.input_proj, self.proj_norm)):
+        for idx, (x_, proj_, norm_) in enumerate(zip(x, self.input_proj, self.proj_norm)):
             lateral = norm_(proj_(x_))
             if idx == 0:
                 laterals.append(lateral)
@@ -160,124 +260,59 @@ class ATMSingleHeadSeg(BaseDecodeHead):
                     laterals.append(l_ + lateral)
 
         lateral = laterals[-1]
-        ori_lateral = lateral.clone()  # for recovery loss
 
-        # Region Alignment Module
-        q = self.combine_token(region_level_bridge, cls_token, text_token)
+        q = self.q_proj(self.get_qs(text_token, cls_token, unseen_token))
+        q = q.transpose(0,1)
 
-        q_ori = q.clone()  # for recovery loss
-
-        q = self.q_proj(q)
-
-        cls_token = cls_token.unsqueeze(1).expand(bs, lateral.size()[1], -1)
-        region_level_bridge = F.interpolate(region_level_bridge,
-                                            size=(H, W),
-                                            mode='bilinear',
-                                            align_corners=False).reshape(
-                                                bs, d, H * W).transpose(1, 2)
-        lateral = torch.cat((region_level_bridge, cls_token, lateral), dim=-1)
-
-        lateral = self.lateral_proj(lateral)
-
-        # semantic segmentation decoder
-        qs = []
-        laterals = []
-        for idx in range(self.num_layers):
-            q, lateral = self.decoder_q.layers[idx](
-                q, lateral), self.decoder_v.layers[idx](lateral, q)
-            qs.append(q)
-            laterals.append(lateral)
-
-        attns = []
-        attn = qs[-1] @ laterals[-1].transpose(-2, -1)
-        attn = attn.transpose(-1, -2)
-        attn = self.d3_to_d4(attn)
-        maps_size.append(attn.size()[-2:])
-        attns.append(attn)
-
-        # for recovery loss
-        if self.training:
-            out['ori_q'] = q_ori
-            out['ori_lateral'] = ori_lateral
-            q, lateral = self.recovery_decoder(q, lateral)
-            out['q'] = q
-            out['lateral'] = lateral
+        for idx, decoder_ in enumerate(self.decoder):
+            q_, attn_ = decoder_(q, lateral.transpose(0, 1))
+            for q, attn in zip(q_, attn_):
+                attn = attn.transpose(-1, -2) 
+                attn = self.d3_to_d4(attn)
+                maps_size.append(attn.size()[-2:])
+                qs.append(q.transpose(0, 1))
+                attns.append(attn)
+        qs = torch.stack(qs, dim=0)
 
         outputs_seg_masks = []
         size = maps_size[-1]
 
-        for i in range(len(attns)):
-            attns[i] = self.fusion_attn_map(attns[i], text_token.shape[0],
-                                            h_rlb * w_rlb)
-
-        for i, attn in enumerate(attns):
-            outputs_seg_masks.append(
-                F.interpolate(attn,
-                              size=size,
-                              mode='bilinear',
-                              align_corners=False))
+        for i_attn, attn in enumerate(attns):
+            if True:
+                outputs_seg_masks.append(F.interpolate(attn, size=size, mode='bilinear', align_corners=False))
+            else:
+                outputs_seg_masks.append(outputs_seg_masks[i_attn - 1] +
+                                         F.interpolate(attn, size=size, mode='bilinear', align_corners=False))
 
         pred = F.interpolate(outputs_seg_masks[-1],
-                             size=(self.image_size, self.image_size),
-                             mode='bilinear',
-                             align_corners=False)
+                                          size=(self.image_size, self.image_size),
+                                          mode='bilinear', align_corners=False)
+                                          
+        out = {"pred_masks": pred}
 
-        out["pred_masks"] = pred
-
+        
         if self.training:
-            outputs_seg_masks = torch.stack(outputs_seg_masks, dim=0)
+            outputs_seg_masks = torch.stack(outputs_seg_masks, dim=0)# (3, bs, 20, 14, 14)
         else:
             if self_training:
-                out["pred"] = self.semantic_inference(out["pred_masks"],
-                                                      self.seen_idx)
+                out["pred"] = self.semantic_inference(out["pred_masks"], self.seen_idx) #(bs, 20, 224, 224)
             else:
-                out["pred"] = self.semantic_inference(out["pred_masks"],
-                                                      self.seen_idx, 0.1)
-            return out["pred"]
+                out["pred"] = self.semantic_inference(out["pred_masks"], self.seen_idx, 0.1)
+            return out["pred"]                  
         return out
-
-    def combine_token(self, region_level_bridge, cls_token, text_token):
-        '''
-        region_level_bridge: bs, d, h', w'
-        cls_token: bs, d
-        text_token: bs, c, d
-        '''
-        b, d, _, _ = region_level_bridge.size()
-        region_level_bridge = region_level_bridge.reshape(b, d,
-                                                          -1).transpose(1, 2)
-        region_level_bridge_size = region_level_bridge.size()[1]
-        text_token = text_token.expand(b, -1, -1)
-        cls_token_hw = cls_token.unsqueeze(1).expand(-1,
-                                                     region_level_bridge_size,
-                                                     -1)
-        rlb_text_token = torch.einsum("bld,bcd->blcd",
-                                      region_level_bridge + cls_token_hw,
-                                      text_token)
-        rlb_text_token = rlb_text_token.reshape(b, -1, d)
-        text_token_hw = text_token.unsqueeze(1).expand(
-            -1, region_level_bridge_size, -1, -1).reshape(b, -1, d)
-        rlb_text_token = torch.concat((rlb_text_token, text_token_hw),
-                                      dim=-1)  # b, l, c, d
-
-        return rlb_text_token
-
-    def fusion_attn_map(self, attn_map, class_num, region_level_bridge_size):
-        '''
-        attn_map: bs, class_num*region_level_bridge_size, h, w
-        class_num: int
-        region_level_bridge_size: int
-        '''
-        _, n_c, _, _ = attn_map.size()
-        rlb_txt_attn = attn_map[:, :class_num, :, :]
-        for i in range(1, region_level_bridge_size):
-            rlb_txt_attn += attn_map[:,
-                                     i * class_num:(i + 1) * class_num, :, :]
-        return rlb_txt_attn / (n_c / class_num)
 
     def semantic_inference(self, mask_pred, seen_idx, weight=0.0):
         mask_pred = mask_pred.sigmoid()
-        mask_pred[:, seen_idx] = mask_pred[:, seen_idx] - weight
+        mask_pred[:,seen_idx] = mask_pred[:,seen_idx] - weight
         return mask_pred
+
+    @torch.jit.unused
+    def _set_aux_loss(self, outputs_seg_masks):
+        return [
+            {"pred_masks": a}
+            # for a in zip(outputs_seg_masks[:-1])
+            for a in outputs_seg_masks[:-1]
+        ]
 
     def d3_to_d4(self, t):
         n, hw, c = t.size()
@@ -289,18 +324,43 @@ class ATMSingleHeadSeg(BaseDecodeHead):
     def d4_to_d3(self, t):
         return t.flatten(-2).transpose(-1, -2)
 
-    @force_fp32(apply_to=('seg_logit', ))
-    def losses(self, seg_logit, seg_label):
+    def get_qs(self, q, cls, unseen):
+        # q: text_token [C, dim]
+        # cls: cls_token [bs, dim]
+        # unseen: unseen_token [bs, dim]
+        C, dim = q.shape
+        bs, _ = cls.shape
+        q = q.expand(bs, -1, -1)  # [bs, C, dim]
+        
+        # Combine cls and unseen tokens using addition (original logic)
+        combined_cls = cls + unseen  # [bs, dim]
+        
+        # Project the concatenated visual token back to original dimension
+        # projected_visual = self.visual_proj(concatenated_visual) # [bs, dim]
+        
+        # Perform einsum with the combined visual token (original logic)
+        q1 = torch.einsum("bd,bcd->bcd", combined_cls, q) # [bs, C, dim]
+        
+        # Concatenate results (remains the same)
+        q_ = torch.concat((q1, q), dim=-1) # [bs, C, dim*2]
+        return q_
+
+
+    @force_fp32(apply_to=('seg_logit',))
+    def losses(self, seg_logit, seg_label, num_classes=None, 
+               unseen_token=None, dino_cls_token=None):
         """Compute segmentation loss."""
         if isinstance(seg_logit, dict):
             # atm loss
             seg_label = seg_label.squeeze(1)
 
-            loss = self.loss_decode(seg_logit,
-                                    seg_label,
-                                    ignore_index=self.ignore_index)
+            loss = self.loss_decode(
+                seg_logit,
+                seg_label,
+                ignore_index = self.ignore_index,
+                unseen_token=unseen_token,
+                dino_cls_token=dino_cls_token
+            )
 
-            loss['acc_seg'] = accuracy(seg_logit["pred_masks"],
-                                       seg_label,
-                                       ignore_index=self.ignore_index)
+            loss['acc_seg'] = accuracy(seg_logit["pred_masks"], seg_label, ignore_index=self.ignore_index)
             return loss

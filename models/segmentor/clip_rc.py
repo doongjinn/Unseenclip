@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
+import os # Import os for path joining
 
 from mmseg.core import add_prefix
 from mmseg.ops import resize
@@ -31,6 +32,8 @@ class CLIPRC(EncoderDecoder):
                  ft_backbone=False,
                  exclude_key=None,
                  load_text_embedding=None,
+                 clip_cls_features_path=None,
+                 dino_features_path=None,
                  **args):
         super(CLIPRC, self).__init__(**args)
 
@@ -40,9 +43,22 @@ class CLIPRC(EncoderDecoder):
             text_encoder.pretrained = pretrained_text
 
         self.text_encoder = builder.build_backbone(text_encoder)
+        
+        # Load pre-extracted DINOv2 features only for training
+        self.dinov2_features = None
+        if dino_features_path is not None and self.training:
+            # Construct the full path relative to the workspace root if necessary
+            # Assuming dinov2_features_path might be relative
+            # full_dinov2_path = os.path.join(os.getcwd(), dinov2_features_path) 
+            # It's usually better if the config provides the absolute path or a path relative to a known root
+            if os.path.exists(dino_features_path):
+                print(f"Loading DINOv2 features from: {dino_features_path}")
+                self.dinov2_features = torch.load(dino_features_path, map_location='cpu') # Load to CPU initially
+            else:
+                print(f"Warning: DINOv2 features path not found: {dino_features_path}")
+                self.dinov2_features = None # Ensure it's None if file not found
 
         self.class_names = class_names
-
         self.base_class = np.asarray(base_class)
         self.novel_class = np.asarray(novel_class)
         self.both_class = np.asarray(both_class)
@@ -134,7 +150,8 @@ class CLIPRC(EncoderDecoder):
         self.align_corners = self.decode_head.align_corners
         self.num_classes = self.decode_head.num_classes
 
-    def _decode_head_forward_train(self, feat, img_metas, gt_semantic_seg):
+    def _decode_head_forward_train(self, feat, img_metas, gt_semantic_seg, train_cfg, 
+                                   unseen_token=None, dino_cls_token=None):
         """Run forward function and calculate loss for decode head in
         training."""
         if self.training:
@@ -146,12 +163,17 @@ class CLIPRC(EncoderDecoder):
         losses = dict()
         if self.self_training:
             loss_decode = self.decode_head.forward_train(
-                feat, img_metas, gt_semantic_seg, self.train_cfg,
-                self.self_training, self.st_mask)
+                feat, img_metas, gt_semantic_seg, train_cfg,
+                self.self_training,
+                st_mask=self.st_mask
+            )
         else:
             loss_decode = self.decode_head.forward_train(
-                feat, img_metas, gt_semantic_seg, self.train_cfg,
-                self.self_training)
+                feat, img_metas, gt_semantic_seg, train_cfg,
+                self.self_training,
+                unseen_token=unseen_token,
+                dino_cls_token=dino_cls_token
+                )
 
         losses.update(add_prefix(loss_decode, 'decode'))
         return losses
@@ -164,62 +186,143 @@ class CLIPRC(EncoderDecoder):
 
     def extract_feat(self, img):
         """Extract features from images."""
-        visual_feat = self.backbone(img)
-        return visual_feat
+        features = self.backbone(img)
+        return {
+            'visual_features': features[0],
+            'cls_token': features[1],
+            'unseen_token': features[2]
+        }
+
+    def _get_dino_features(self, img_metas, device):
+        """Get DINOv2 features for the current batch of images."""
+        if self.dinov2_features is None or not self.training:
+            return None
+            
+        batch_features = []
+        not_found_count = 0
+        for meta in img_metas:
+            filename_key = meta.get('ori_filename', meta.get('filename'))
+            if filename_key is None:
+                print("Warning: Could not determine filename from img_meta. Cannot retrieve DINOv2 features.")
+                return None
+            try:
+                img_key = os.path.splitext(os.path.basename(filename_key))[0]
+            except Exception as e:
+                print(f"Warning: Error extracting img_key from {filename_key}. Error: {e}")
+                img_key = None
+
+            if img_key and img_key in self.dinov2_features:
+                batch_features.append(self.dinov2_features[img_key].to(device))
+            else:
+                not_found_count += 1
+                try:
+                    example_feat = next(iter(self.dinov2_features.values()))
+                    placeholder = torch.zeros_like(example_feat, device=device)
+                except StopIteration:
+                    print("Warning: DINOv2 feature dictionary is empty. Cannot create placeholder.")
+                    placeholder_dim = getattr(self.backbone, 'output_dim', 768)
+                    placeholder = torch.zeros(placeholder_dim, device=device)
+                batch_features.append(placeholder)
+
+        if not_found_count > 0 and rank == 0:
+            print(f"Warning: DINOv2 features not found or failed to extract key for {not_found_count}/{len(img_metas)} images in the batch.")
+            
+        if not batch_features:
+             print("Warning: No DINOv2 features could be collected for the batch.")
+             return None
+        try:
+            return torch.stack(batch_features)
+        except RuntimeError as e:
+             print(f"Error stacking DINOv2 features: {e}. Check feature dimensions.")
+             for i, feat in enumerate(batch_features):
+                 print(f"Feature {i} shape: {feat.shape}")
+             return None
 
     def forward_train(self, img, img_metas, gt_semantic_seg):
-        visual_feat = self.extract_feat(img)
+        """Forward function for training."""
+        features = self.extract_feat(img)
+        
+        # Get text features
         if self.load_text_embedding:
             text_feat = np.load(self.load_text_embedding)
             text_feat = torch.from_numpy(text_feat).to(img.device)
         else:
-            if not self.multi_prompts:
-                text_feat = self.text_embedding(self.texts, img)
-            else:
-                assert AttributeError("preparing the multi embeddings")
+            text_feat = self.text_embedding(self.texts, img)
 
-        if not self.self_training:
-            text_feat = text_feat[self.base_class, :]
-
+        # Format features as expected by decoder
         feat = []
-        feat.append(visual_feat)
+        feat.append([
+            features['visual_features'],
+            features['cls_token'],
+            features['unseen_token']
+        ])
         feat.append(text_feat)
+        
+        # Get DINOv2 features for the batch
+        dino_cls_token = self._get_dino_features(img_metas, img.device)
 
-        losses = dict()
-        loss_decode = self._decode_head_forward_train(feat, img_metas,
-                                                      gt_semantic_seg)
-        losses.update(loss_decode)
+        # --- ADDED: Detach dino_cls_token to prevent grads flowing back ---
+        if dino_cls_token is not None:
+            dino_cls_token = dino_cls_token.detach()
+        # ------------------------------------------------------------------
 
+        losses = self._decode_head_forward_train(
+            feat, 
+            img_metas,
+            gt_semantic_seg,
+            self.train_cfg,
+            unseen_token=features['unseen_token'],
+            dino_cls_token=dino_cls_token
+            )
+            
         return losses
 
     def encode_decode(self, img, img_metas):
-        visual_feat = self.extract_feat(img)
+        # Extract visual features
+        features = self.extract_feat(img)
 
+        # Get text features (similar to forward_train)
         if self.load_text_embedding:
-            text_feat = np.load(self.load_text_embedding)
-            text_feat = torch.from_numpy(text_feat).to(img.device)
+            # Ensure text_feat is loaded or cached appropriately during inference
+            # For simplicity, assuming it might be pre-loaded if needed
+            # Or recalculate if necessary (check performance implications)
+            if not hasattr(self, '_cached_text_feat') or self._cached_text_feat is None:
+                 try: 
+                     text_feat = np.load(self.load_text_embedding)
+                     self._cached_text_feat = torch.from_numpy(text_feat).to(img.device)
+                 except FileNotFoundError:
+                      print(f"Warning: Text embedding file {self.load_text_embedding} not found during encode_decode. Attempting to generate.")
+                      if hasattr(self, 'texts'):
+                          self._cached_text_feat = self.text_embedding(self.texts, img)
+                      else: # Fallback if texts not available
+                           print("Error: Cannot get text features during inference.")
+                           # Return zeros or raise error, depending on desired behavior
+                           # Returning zeros based on the shape of visual features
+                           num_classes = self.num_classes # Get num_classes from __init__
+                           embed_dim = features['cls_token'].shape[-1] # Get embed_dim
+                           self._cached_text_feat = torch.zeros((num_classes, embed_dim), device=img.device)
+            text_feat = self._cached_text_feat
         else:
-            if not self.multi_prompts:
-                text_feat = self.text_embedding(self.texts, img)
-            else:
-                num_cls, num_prompts, _ = self.texts.size()
-                text_feat = self.text_embedding(
-                    self.texts.reshape(num_cls * num_prompts, -1), img)
-                text_feat = text_feat.reshape(num_cls, num_prompts,
-                                              -1).mean(dim=1)
-                text_feat /= text_feat.norm(dim=-1).unsqueeze(1)
+            # Ensure self.texts is initialized
+            if not hasattr(self, 'texts'):
+                 self.texts = torch.cat([tokenize(f"a photo of a {c}") for c in self.class_names])
+            text_feat = self.text_embedding(self.texts, img)
 
+        # Format features for the decoder head (similar to forward_train)
+        # Note: DINO features are typically not used during inference/testing
         feat = []
-        feat.append(visual_feat)
+        feat.append([
+            features['visual_features'],
+            features['cls_token'],
+            features['unseen_token'] 
+        ])
         feat.append(text_feat)
 
-        out = self._decode_head_forward_test(feat, img_metas,
-                                             self.self_training)
-        out = resize(input=out,
-                     size=img.shape[2:],
-                     mode='bilinear',
-                     align_corners=self.align_corners)
-        return out
+        # Call the decoder head's forward_test method
+        # Pass the formatted features list/tuple as the primary input 'x'
+        # Assuming self_training is False during standard inference
+        seg_logits = self._decode_head_forward_test(feat, img_metas, self_training=False)
+        return seg_logits
 
     def _decode_head_forward_test(self, x, img_metas, self_training):
         """Run forward function and calculate loss for decode head in

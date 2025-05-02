@@ -1,6 +1,6 @@
 # dataset settings
 dataset_type = 'ZeroPascalVOCDataset20'
-data_root = '/home/zy/datasets/pascal_voc/VOC2012'
+data_root = '/nas_homes/dataset/VOC2012'
 img_norm_cfg = dict(mean=[123.675, 116.28, 103.53],
                     std=[58.395, 57.12, 57.375],
                     to_rgb=True)
